@@ -30,9 +30,11 @@
 全部约束关于 w 为线性，用**两阶段单纯形法**（tableau + Bland 反循环规则）
 在纯 Python 内求解，无第三方依赖：第一阶段求初始可行基（其任一基本可行解
 即一组可行配比），第二阶段对每个样本分别最小化 / 最大化其权重，共
-1 + 2k 次求解。无解时再解一个引入松弛标量 t 的线性规划，得到约束允许的
-最小最大行误差（minimax），用于无解说明。规模上界：变量 ≤ 6、约束
-≤ 2·40 + 1 = 81 行。
+1 + 2k 次求解。可行性以**求解后校验**为准：候选配比按输出精度舍入后仍须
+满足非负、总和为 1 与全部逐行输入容差（数值余量与条带超限标记相同，保证
+结论与逐行判定一致），否则按无解处理。无解时再解一个引入松弛标量 t 的
+线性规划，得到约束允许的最小最大行误差（minimax），用于无解说明（该值
+为正时不得被舍入为 0）。规模上界：变量 ≤ 6、约束 ≤ 2·40 + 1 = 81 行。
 """
 
 from __future__ import annotations
@@ -50,12 +52,22 @@ MAX_PREDICTED_LENGTHS = 40
 SUM_TOLERANCE = 1e-9
 # 单纯形数值参数
 _PIVOT_EPS = 1e-12  # 系数视为正的阈值
-_FEAS_EPS = 1e-7  # 第一阶段最优值视为 0 的阈值
+# 第一阶段最优值视为 0 的阈值：份额为 O(1) 量级时第一阶段舍入噪声 ~1e-15，
+# 1e-9 远高于噪声，又远低于任何有实际意义的输入容差（0～0.05）
+_FEAS_EPS = 1e-9
 _OBJ_EPS = 1e-10  # 检验数视为负的阈值
 _MAX_PIVOTS = 200_000  # Bland 规则下理论上有限，这里仅作兜底
 # 输出清理：把浮点噪声截断到 0 / 1
 _OUTPUT_EPS = 5e-9
 _OUTPUT_ROUND = 10
+# 浮点噪声截断阈值（读解与配比清理用）：仅截断 ~1e-13 量级的舍入噪声，
+# 边界上真实存在的微小配比分量必须保留，避免误拒临近可行域边界的输入
+_NOISE_EPS = 1e-12
+# 逐行误差与权重和的数值余量：条带超限标记与求解后校验共用同一阈值，
+# 保证“有解”结论与逐行判定一致；该余量同时覆盖输出舍入（≤10 位小数）
+# 对配比引入的扰动（≤ ~6e-10），故真实可行输入不会因舍入被误拒
+_ROW_SLACK = 1e-9
+_SUM_SLACK = 1e-9
 
 
 class MixtureInputError(ValueError):
@@ -121,12 +133,12 @@ def _pivot(tableau: list[list[float]], basis: list[int], entering: int,
 
 def _read_solution(tableau: list[list[float]], basis: list[int],
                    n: int, col_count: int) -> list[float]:
-    """从规范形 tableau 读出原始变量 x_0..x_{n-1} 的取值。"""
+    """从规范形 tableau 读出原始变量 x_0..x_{n-1} 的取值（仅截断舍入噪声）。"""
     x = [0.0] * n
     for i, basic_col in enumerate(basis):
         if basic_col < n:
             value = tableau[i][col_count]
-            x[basic_col] = 0.0 if abs(value) < _OUTPUT_EPS else value
+            x[basic_col] = 0.0 if abs(value) < _NOISE_EPS else value
     return x
 
 
@@ -320,21 +332,50 @@ def _round_value(value: float) -> float:
     return 0.0 if abs(rounded) < _OUTPUT_EPS else rounded
 
 
+def _round_positive(value: float) -> float:
+    """输出用：正的最小最大行误差不得被舍入为 0（必要时保留更多位小数）。"""
+    rounded = _round_value(value)
+    if rounded == 0.0 and value > 0.0:
+        rounded = round(value, 15)
+        if rounded == 0.0:
+            rounded = value
+    return rounded
+
+
 def _round_weights(weights: list[float], count: int) -> list[float]:
+    """输出用配比舍入：仅截断舍入噪声、保留 10 位小数，并把与 1 的残差
+    补到绝对值最大的分量上，使舍入后的配比仍非负且总和为 1。"""
     cleaned: list[float] = []
     for value in weights:
-        if abs(value) < _OUTPUT_EPS:
+        if abs(value) < _NOISE_EPS:
             cleaned.append(0.0)
-        elif abs(value - 1.0) < _OUTPUT_EPS:
+        elif abs(value - 1.0) < _NOISE_EPS:
             cleaned.append(1.0)
         else:
             cleaned.append(value)
+    rounded = [round(value, _OUTPUT_ROUND) for value in cleaned]
     # 消除归一化噪声：把与 1 的残差补到绝对值最大的分量上
-    residual = 1.0 - sum(cleaned)
-    if abs(residual) <= 1e-7:
-        idx = max(range(count), key=lambda i: abs(cleaned[i]))
-        cleaned[idx] += residual
-    return [_round_value(value) for value in cleaned]
+    residual = 1.0 - sum(rounded)
+    if residual != 0.0:
+        idx = max(range(count), key=lambda i: abs(rounded[i]))
+        rounded[idx] = round(rounded[idx] + residual, _OUTPUT_ROUND)
+    return rounded
+
+
+def _verify_weights(weights: list[float], matrix: list[list[float]],
+                    observed: list[float], tolerance: float) -> bool:
+    """求解后校验：对外舍入后的配比仍须满足非负、总和为 1、全部逐行输入
+    容差（余量与条带超限标记相同，保证结论与逐行判定一致）。"""
+    k = len(weights)
+    if any(value < 0.0 for value in weights):
+        return False
+    if abs(sum(weights) - 1.0) > _SUM_SLACK:
+        return False
+    for col, obs in enumerate(observed):
+        pred = sum(matrix[i][col] * weights[i] for i in range(k))
+        if abs(pred - obs) > tolerance + _ROW_SLACK:
+            return False
+    return True
 
 
 def _build_band_rows(lengths: list[int], observed: list[float],
@@ -350,7 +391,7 @@ def _build_band_rows(lengths: list[int], observed: list[float],
             "observed_share": _round_value(observed[idx]),
             "predicted_share": _round_value(predicted[idx]),
             "abs_error": _round_value(error),
-            "within_tolerance": error <= tolerance + 1e-9,
+            "within_tolerance": error <= tolerance + _ROW_SLACK,
         }
         if include_shares and sample_shares is not None:
             row["sample_shares"] = [
@@ -456,10 +497,48 @@ def mixture_deconvolution(
         "tolerance": tolerance,
     }
 
-    # ---- 第一组 LP：可行性（目标函数取 0，第一阶段的 BFS 即可行配比） ----
+    # ---- 第一组 LP：可行性（目标函数取 0，第一阶段的 BFS 即候选可行配比） ----
     feasible_weights, _ = solve_lp([0.0] * k, constraints)
 
-    if feasible_weights is None:
+    # 求解后校验：对外舍入后的候选配比仍须满足非负、总和为 1、全部逐行输入
+    # 容差（数值余量与条带超限标记相同）；校验不过则按无解处理
+    weights: list[float] | None = None
+    if feasible_weights is not None:
+        candidate = _round_weights(feasible_weights, k)
+        if _verify_weights(candidate, matrix, observed, tolerance):
+            weights = candidate
+
+    # ---- 每份样本可行配比的最小值 / 最大值（端点配比同样先求解后校验） ----
+    ranges: list[dict] = []
+    if weights is not None:
+        for i in range(k):
+            endpoint: dict = {}
+            for kind, objective in (("min", 1.0), ("max", -1.0)):
+                c = [0.0] * k
+                c[i] = objective
+                w, _ = solve_lp(c, constraints)
+                w_clean = _round_weights(w, k) if w is not None else None
+                if w_clean is None or not _verify_weights(
+                    w_clean, matrix, observed, tolerance
+                ):
+                    # 可行域实际为空的边界数值情形（不可行间隙不超过校验余量）：
+                    # 放弃有解结论，按无解处理并给出最小最大行误差
+                    weights = None
+                    break
+                pred = _weighted_shares(w_clean, sample_shares, lengths)
+                endpoint[kind] = {
+                    "value": _round_value(w_clean[i]),
+                    "weights": w_clean,
+                    "predicted_bands": _build_band_rows(
+                        lengths, observed, pred, tolerance
+                    ),
+                }
+            if weights is None:
+                break
+            ranges.append({"sample_index": i + 1, "min": endpoint["min"],
+                           "max": endpoint["max"]})
+
+    if weights is None:
         # ---- 无解：minimax LP 求约束允许的最小最大行误差 ----
         # 变量 (w_0..w_{k-1}, t)，t ≥ 0；增加 |A·w − obs| ≤ t 两行约束并最小化 t
         mm_constraints: list[tuple[str, list[float], float]] = [
@@ -472,7 +551,7 @@ def mixture_deconvolution(
         _, min_max_error = solve_lp([0.0] * k + [1.0], mm_constraints)
         result["solvable"] = False
         result["minimal_max_error"] = (
-            None if min_max_error is None else _round_value(min_max_error)
+            None if min_max_error is None else _round_positive(min_max_error)
         )
         result["message"] = (
             f"无解：在非负且总和为 1 的连续质量配比（{k} 份样本）上，"
@@ -486,7 +565,6 @@ def mixture_deconvolution(
         )
         return result
 
-    weights = _round_weights(feasible_weights, k)
     predicted = _weighted_shares(weights, sample_shares, lengths)
     max_error = max(
         (abs(predicted[idx] - observed[idx]) for idx in range(len(lengths))),
@@ -502,27 +580,5 @@ def mixture_deconvolution(
         ),
         "max_error": _round_value(max_error),
     }
-
-    # ---- 每份样本可行配比的最小值 / 最大值及对应预测条带 ----
-    ranges: list[dict] = []
-    for i in range(k):
-        endpoint: dict = {}
-        for kind, objective in (("min", 1.0), ("max", -1.0)):
-            c = [0.0] * k
-            c[i] = objective
-            w, value = solve_lp(c, constraints)
-            if w is None:  # 可行域已确认非空，不应发生
-                raise _LpError(f"求解样本 {i + 1} 的配比{kind}值时意外失败")
-            w_clean = _round_weights(w, k)
-            pred = _weighted_shares(w_clean, sample_shares, lengths)
-            endpoint[kind] = {
-                "value": _round_value(value if kind == "min" else -value),
-                "weights": w_clean,
-                "predicted_bands": _build_band_rows(
-                    lengths, observed, pred, tolerance
-                ),
-            }
-        ranges.append({"sample_index": i + 1, "min": endpoint["min"],
-                       "max": endpoint["max"]})
     result["sample_ranges"] = ranges
     return result
